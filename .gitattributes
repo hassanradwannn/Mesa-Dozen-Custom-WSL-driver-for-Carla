@@ -1,0 +1,12 @@
+# Keep Linux scripts/patches/checksums stable when Git for Windows is used.
+* text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+README.md text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof
+*.json text eol=lf
+SHA256SUMS text eol=lf
+licenses/** text eol=lf whitespace=-blank-at-eol,-blank-at-eof
+*.so binary

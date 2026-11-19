@@ -1,0 +1,1426 @@
+--- a/src/microsoft/vulkan/dzn_cmd_buffer.c
++++ b/src/microsoft/vulkan/dzn_cmd_buffer.c
+@@ -381,6 +381,115 @@
+    }
+ }
+ 
++/* The cache owns ordinary RAM comparison bytes, never a readback pointer into
++ * a write-combined UPLOAD resource. Its entries are private to this command
++ * buffer and discarded on reset. Limits: 4096 entries and 4MiB shadow bytes.
++ */
++struct dzn_snapshot_region {
++   uint64_t key[4]; /* buffer identity, generation, source offset, source size */
++   uint64_t gpuva;
++   uint8_t bytes[];
++};
++static uint32_t
++dzn_snapshot_region_hash(const void *key)
++{
++   return _mesa_hash_data(key, sizeof(((struct dzn_snapshot_region *)0)->key));
++}
++static bool
++dzn_snapshot_region_equal(const void *a, const void *b)
++{
++   return !memcmp(a, b, sizeof(((struct dzn_snapshot_region *)0)->key));
++}
++static void
++dzn_snapshot_region_free(struct hash_entry *entry)
++{
++   free(entry->data);
++}
++
++/* A cache entry owns exactly one D3D reference and any persistent CPU map.
++ * Ownership moves from a retired command buffer into the cache and then into
++ * one new command buffer. No application VkBuffer/VkDeviceMemory is cached.
++ */
++static bool
++dzn_upload_pool_put(struct dzn_device *device, const struct dzn_internal_resource *res)
++{
++   if (!device->upload_pool_initialized || !res->upload_pool_eligible ||
++       res->size > device->upload_pool_limit)
++      return false;
++   struct dzn_upload_cache_entry *entry = malloc(sizeof(*entry));
++   if (!entry)
++      return false;
++   *entry = (struct dzn_upload_cache_entry) {
++      .res = res->res, .size = res->size, .map = res->snapshot_map, .gpuva = res->gpuva,
++   };
++   bool cached = false;
++   mtx_lock(&device->upload_pool_lock);
++   if (res->size <= device->upload_pool_limit - device->upload_pool_bytes) {
++      entry->next = device->upload_pool;
++      device->upload_pool = entry;
++      device->upload_pool_bytes += res->size;
++      device->upload_pool_peak = MAX2(device->upload_pool_peak, device->upload_pool_bytes);
++      device->upload_pool_returns++;
++      cached = true;
++   } else {
++      device->upload_pool_drops++;
++   }
++   mtx_unlock(&device->upload_pool_lock);
++   if (!cached)
++      free(entry);
++   return cached;
++}
++
++static struct dzn_upload_cache_entry *
++dzn_upload_pool_take(struct dzn_device *device, uint64_t size)
++{
++   struct dzn_upload_cache_entry **best = NULL;
++   mtx_lock(&device->upload_pool_lock);
++   for (struct dzn_upload_cache_entry **p = &device->upload_pool; *p; p = &(*p)->next) {
++      if ((*p)->size >= size && (!best || (*p)->size < (*best)->size)) {
++         best = p;
++         if ((*p)->size == size)
++            break;
++      }
++   }
++   struct dzn_upload_cache_entry *entry = best ? *best : NULL;
++   if (entry) {
++      *best = entry->next;
++      device->upload_pool_bytes -= entry->size;
++      device->upload_pool_hits++;
++   } else {
++      device->upload_pool_misses++;
++   }
++   mtx_unlock(&device->upload_pool_lock);
++   return entry;
++}
++
++void
++dzn_upload_pool_finish(struct dzn_device *device)
++{
++   if (!device->upload_pool_initialized)
++      return;
++   if (device->profile_descriptors)
++      fprintf(stderr, "DZN_UPLOAD_POOL_SUMMARY hits=%llu misses=%llu returns=%llu drops=%llu retained_bytes=%llu peak_bytes=%llu limit_bytes=%llu\n",
++         (unsigned long long)device->upload_pool_hits, (unsigned long long)device->upload_pool_misses,
++         (unsigned long long)device->upload_pool_returns, (unsigned long long)device->upload_pool_drops,
++         (unsigned long long)device->upload_pool_bytes, (unsigned long long)device->upload_pool_peak,
++         (unsigned long long)device->upload_pool_limit);
++   struct dzn_upload_cache_entry *entry = device->upload_pool;
++   while (entry) {
++      struct dzn_upload_cache_entry *next = entry->next;
++      if (entry->map)
++         ID3D12Resource_Unmap(entry->res, 0, NULL);
++      ID3D12Resource_Release(entry->res);
++      free(entry);
++      entry = next;
++   }
++   device->upload_pool = NULL;
++   device->upload_pool_bytes = 0;
++   mtx_destroy(&device->upload_pool_lock);
++   device->upload_pool_initialized = false;
++}
++
+ static void
+ dzn_cmd_buffer_destroy(struct vk_command_buffer *cbuf)
+ {
+@@ -404,11 +513,19 @@
+    for (uint32_t bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket) {
+       list_for_each_entry_safe(struct dzn_internal_resource, res, &cmdbuf->internal_bufs[bucket], link) {
+          list_del(&res->link);
+-         ID3D12Resource_Release(res->res);
++         struct dzn_device *resource_device = container_of(cbuf->base.device, struct dzn_device, vk);
++         if (!dzn_upload_pool_put(resource_device, res)) {
++            if (res->snapshot_map)
++               ID3D12Resource_Unmap(res->res, 0, NULL);
++            ID3D12Resource_Release(res->res);
++         }
+          vk_free(&cbuf->pool->alloc, res);
+       }
+    }
+ 
++   if (cmdbuf->snapshot_regions)
++      _mesa_hash_table_destroy(cmdbuf->snapshot_regions, dzn_snapshot_region_free);
++   dzn_descriptor_heap_finish(&cmdbuf->snapshot_scratch);
+    dzn_descriptor_heap_pool_finish(&cmdbuf->cbv_srv_uav_pool);
+    dzn_descriptor_heap_pool_finish(&cmdbuf->sampler_pool);
+    dzn_descriptor_heap_pool_finish(&cmdbuf->rtvs.pool);
+@@ -464,13 +581,27 @@
+    cmdbuf->state.multiview.num_views = 1;
+    cmdbuf->state.multiview.view_mask = 1;
+ 
++   struct dzn_device *device = container_of(cbuf->base.device, struct dzn_device, vk);
++   uint64_t reset_begin = device->profile_descriptors ? os_time_get_nano() : 0;
++   uint32_t released_uploads = 0;
+    /* TODO: Return resources to the pool */
+    for (uint32_t bucket = 0; bucket < DZN_INTERNAL_BUF_BUCKET_COUNT; ++bucket) {
+       list_for_each_entry_safe(struct dzn_internal_resource, res, &cmdbuf->internal_bufs[bucket], link) {
+          list_del(&res->link);
+-         ID3D12Resource_Release(res->res);
++         released_uploads += bucket == DZN_INTERNAL_BUF_UPLOAD;
++         struct dzn_device *resource_device = container_of(cbuf->base.device, struct dzn_device, vk);
++         if (!dzn_upload_pool_put(resource_device, res)) {
++            if (res->snapshot_map)
++               ID3D12Resource_Unmap(res->res, 0, NULL);
++            ID3D12Resource_Release(res->res);
++         }
+          vk_free(&cmdbuf->vk.pool->alloc, res);
+       }
++   }
++   if (reset_begin) {
++      static _Thread_local struct dzn_profile_descriptor_stats reset_stats;
++      dzn_profile_descriptor_end("command_reset_upload_release", reset_begin,
++         released_uploads, &reset_stats);
+    }
+    cmdbuf->cur_upload_buf = NULL;
+ 
+@@ -499,6 +630,9 @@
+       vk_free(&cmdbuf->vk.pool->alloc, he->data);
+    _mesa_hash_table_clear(cmdbuf->transition_barriers, NULL);
+    dzn_descriptor_heap_pool_reset(&cmdbuf->dsvs.pool);
++   if (cmdbuf->snapshot_regions)
++      _mesa_hash_table_clear(cmdbuf->snapshot_regions, dzn_snapshot_region_free);
++   cmdbuf->snapshot_region_bytes = 0;
+    dzn_descriptor_heap_pool_reset(&cmdbuf->cbv_srv_uav_pool);
+    dzn_descriptor_heap_pool_reset(&cmdbuf->sampler_pool);
+ 
+@@ -631,6 +765,10 @@
+                                  D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                                  true, &pool->alloc);
+ 
++   if (device->snapshot_uniforms && device->cache_uniform_regions)
++      cmdbuf->snapshot_regions = _mesa_hash_table_create(NULL,
++         dzn_snapshot_region_hash, dzn_snapshot_region_equal);
++   /* An optional cache allocation failure falls back to uncached snapshots. */
+    cmdbuf->events.ht =
+       _mesa_pointer_hash_table_create(NULL);
+    cmdbuf->queries.ht =
+@@ -1793,6 +1931,36 @@
+       /* Align size on 64k (the default alignment) */
+       alloc_size = ALIGN_POT(size, 64 * 1024);
+ 
++   bool pool_eligible = device->upload_pool_initialized &&
++      bucket == DZN_INTERNAL_BUF_UPLOAD && init_state == D3D12_RESOURCE_STATE_GENERIC_READ;
++   if (pool_eligible) {
++      uint64_t reuse_begin = device->profile_descriptors ? os_time_get_nano() : 0;
++      struct dzn_internal_resource *entry =
++         vk_alloc(&cmdbuf->vk.pool->alloc, sizeof(*entry), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++      if (!entry)
++         return vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      struct dzn_upload_cache_entry *cached = dzn_upload_pool_take(device, alloc_size);
++      if (cached) {
++         entry->res = cached->res;
++         entry->size = cached->size;
++         entry->snapshot_map = cached->map;
++         entry->gpuva = cached->gpuva;
++         entry->upload_pool_eligible = true;
++         free(cached);
++         list_addtail(&entry->link, &cmdbuf->internal_bufs[bucket]);
++         cmdbuf->cur_upload_buf = entry;
++         cmdbuf->cur_upload_buf_offset = size;
++         *out = entry->res;
++         if (offset) *offset = 0;
++         if (reuse_begin) {
++            static _Thread_local struct dzn_profile_descriptor_stats reuse_stats;
++            dzn_profile_descriptor_end("internal_upload_pool_reuse", reuse_begin, entry->size, &reuse_stats);
++         }
++         return VK_SUCCESS;
++      }
++      vk_free(&cmdbuf->vk.pool->alloc, entry);
++   }
++
+    D3D12_HEAP_PROPERTIES hprops = dzn_ID3D12Device4_GetCustomHeapProperties(device->dev, 0, heap_type);
+    D3D12_RESOURCE_DESC rdesc = {
+       .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+@@ -1807,12 +1975,19 @@
+       .Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    };
+ 
++   uint64_t create_begin = device->profile_descriptors ? os_time_get_nano() : 0;
+    HRESULT hres =
+       ID3D12Device1_CreateCommittedResource(device->dev, &hprops,
+                                             D3D12_HEAP_FLAG_NONE, &rdesc,
+                                             init_state, NULL,
+                                             &IID_ID3D12Resource,
+                                             (void **)&res);
++   if (create_begin) {
++      static _Thread_local struct dzn_profile_descriptor_stats upload_commits, other_commits;
++      dzn_profile_descriptor_end(bucket == DZN_INTERNAL_BUF_UPLOAD ?
++         "internal_upload_committed" : "internal_other_committed", create_begin,
++         alloc_size, bucket == DZN_INTERNAL_BUF_UPLOAD ? &upload_commits : &other_commits);
++   }
+    if (FAILED(hres)) {
+       return vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+@@ -1827,6 +2002,12 @@
+ 
+    entry->res = res;
+    entry->size = alloc_size;
++   entry->snapshot_map = NULL;
++   entry->upload_pool_eligible = pool_eligible;
++   /* Committed buffer addresses remain valid for the lifetime of the resource.
++    * Reuse the address instead of querying the D3D resource for each CBV.
++    */
++   entry->gpuva = ID3D12Resource_GetGPUVirtualAddress(res);
+    list_addtail(&entry->link, &cmdbuf->internal_bufs[bucket]);
+    *out = entry->res;
+    if (offset)
+@@ -3250,6 +3431,202 @@
+       ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, view_instance_mask);
+ }
+ 
++/* Compatibility mode for applications which recycle host uniform data while
++ * recording a command buffer. Capture the descriptor's bytes at its recorded use
++ * and retain the upload allocation until the command buffer is reset. This is
++ * deliberately opt-in: Vulkan applications may legally update uniform contents
++ * between command recording and submission.
++ */
++static bool
++dzn_cmd_buffer_snapshot_uniform_live(struct dzn_cmd_buffer *cmdbuf,
++                                struct dzn_device *device,
++                                struct dzn_descriptor_heap *heap, uint32_t slot,
++                                const struct dzn_buffer_desc *info)
++{
++   if (!info->buffer || info->offset > info->buffer->size)
++      return false;
++
++   uint64_t size = info->range == VK_WHOLE_SIZE ?
++      info->buffer->size - info->offset : info->range;
++   if (!size || size > info->buffer->size - info->offset)
++      return false;
++
++   /* Match the CBV range used by dzn_descriptor_heap_write_buffer_desc.
++    * VK_WHOLE_SIZE and large ranges still expose at most 64KB to D3D12.
++    * Skipping them would silently leave those uniforms unprotected.
++    */
++   if (size > 65536) {
++      if (getenv("DZN_DIAG_ALLOC")) {
++         static unsigned trace_count;
++         if (p_atomic_inc_return(&trace_count) <= 12)
++            fprintf(stderr, "DZN_LARGE_UNIFORM range=%llu offset=%llu\n",
++                    (unsigned long long)size, (unsigned long long)info->offset);
++      }
++      size = 65536;
++   }
++
++   static _Thread_local struct dzn_profile_descriptor_stats source_stats, alloc_stats, write_stats, cbv_stats;
++   uint64_t stage_begin = device->profile_descriptors ? os_time_get_nano() : 0;
++   const uint8_t *src;
++   void *mapped_src = NULL;
++   const struct dzn_device_memory *memory = info->buffer->memory;
++   if (memory && memory->map) {
++      src = (const uint8_t *)memory->map + info->buffer->memory_offset + info->offset;
++   } else {
++      if (FAILED(ID3D12Resource_Map(info->buffer->res, 0, NULL, &mapped_src)))
++         return false;
++      src = (const uint8_t *)mapped_src + info->offset;
++   }
++
++   if (stage_begin) {
++      dzn_profile_descriptor_end("snapshot_source_map", stage_begin, mapped_src != NULL, &source_stats);
++      stage_begin = os_time_get_nano();
++   }
++   const uint32_t alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
++   const uint32_t aligned_size = ALIGN_POT(size, alignment);
++   uint64_t snapshot_gpuva;
++   struct dzn_snapshot_region *region = NULL;
++   const uint64_t region_key[4] = { (uintptr_t)info->buffer,
++      info->snapshot_generation, info->offset, size };
++   if (cmdbuf->snapshot_regions) {
++      uint64_t lookup_begin = device->profile_descriptors ? os_time_get_nano() : 0;
++      struct hash_entry *entry = _mesa_hash_table_search(cmdbuf->snapshot_regions, region_key);
++      region = entry ? entry->data : NULL;
++      bool hit = region && !memcmp(region->bytes, src, size);
++      if (lookup_begin) {
++         static _Thread_local struct dzn_profile_descriptor_stats lookup_stats;
++         dzn_profile_descriptor_end("snapshot_region_lookup", lookup_begin, hit, &lookup_stats);
++      }
++      if (hit) {
++         snapshot_gpuva = region->gpuva;
++         if (mapped_src) {
++            D3D12_RANGE no_write = {0, 0};
++            ID3D12Resource_Unmap(info->buffer->res, 0, &no_write);
++         }
++         if (stage_begin) stage_begin = os_time_get_nano();
++         goto write_snapshot_descriptor;
++      }
++   }
++   ID3D12Resource *snapshot;
++   uint64_t offset;
++   VkResult result = dzn_cmd_buffer_alloc_internal_buf(cmdbuf, aligned_size,
++      DZN_INTERNAL_BUF_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, alignment,
++      &snapshot, &offset);
++   if (result != VK_SUCCESS) {
++      if (mapped_src)
++         ID3D12Resource_Unmap(info->buffer->res, 0, NULL);
++      vk_command_buffer_set_error(&cmdbuf->vk, result);
++      return true;
++   }
++
++   if (stage_begin) {
++      dzn_profile_descriptor_end("snapshot_allocate", stage_begin, aligned_size, &alloc_stats);
++      stage_begin = os_time_get_nano();
++   }
++   /* Upload allocations are CPU-written only. Keep one map per allocation,
++    * rather than mapping its entire 4MB range for every uniform descriptor.
++    */
++   struct dzn_internal_resource *upload = cmdbuf->cur_upload_buf;
++   assert(upload && upload->res == snapshot);
++   D3D12_RANGE no_read = { 0, 0 };
++   if (!upload->snapshot_map &&
++       FAILED(ID3D12Resource_Map(snapshot, 0, &no_read, &upload->snapshot_map))) {
++      if (mapped_src)
++         ID3D12Resource_Unmap(info->buffer->res, 0, NULL);
++      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_MEMORY_MAP_FAILED);
++      return true;
++   }
++   memset((uint8_t *)upload->snapshot_map + offset, 0, aligned_size);
++   memcpy((uint8_t *)upload->snapshot_map + offset, src, size);
++   snapshot_gpuva = upload->gpuva + offset;
++   if (cmdbuf->snapshot_regions) {
++      if (!region && cmdbuf->snapshot_regions->entries < 4096 &&
++          size <= 4 * 1024 * 1024 - cmdbuf->snapshot_region_bytes) {
++         region = malloc(sizeof(*region) + size);
++         if (region) {
++            memcpy(region->key, region_key, sizeof(region_key));
++            if (!_mesa_hash_table_insert(cmdbuf->snapshot_regions, region->key, region)) {
++               free(region);
++               region = NULL;
++            } else {
++               cmdbuf->snapshot_region_bytes += size;
++            }
++         }
++      }
++      if (region) {
++         memcpy(region->bytes, src, size);
++         region->gpuva = snapshot_gpuva;
++      }
++   }
++   if (mapped_src)
++      ID3D12Resource_Unmap(info->buffer->res, 0, &no_read);
++
++   if (stage_begin) {
++      dzn_profile_descriptor_end("snapshot_copy_and_unmap", stage_begin, size, &write_stats);
++      stage_begin = os_time_get_nano();
++   }
++write_snapshot_descriptor:;
++   D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {
++      .BufferLocation = snapshot_gpuva,
++      .SizeInBytes = aligned_size,
++   };
++   D3D12_CPU_DESCRIPTOR_HANDLE destination = dzn_descriptor_heap_get_cpu_handle(heap, slot);
++   if (device->stage_snapshot_descriptors) {
++      /* Avoid constructing a CBV directly in the write-combined GPU heap.
++       * The scratch CPU descriptor is consumed synchronously by CopyDescriptors
++       * and can be reused immediately. The GPU destination remains immutable
++       * for this recorded use. Command buffer recording is externally serialized.
++       */
++      if (!cmdbuf->snapshot_scratch.heap) {
++         VkResult allocated = dzn_descriptor_heap_init(&cmdbuf->snapshot_scratch,
++            device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, false);
++         if (allocated != VK_SUCCESS) {
++            vk_command_buffer_set_error(&cmdbuf->vk, allocated);
++            return true;
++         }
++      }
++      D3D12_CPU_DESCRIPTOR_HANDLE scratch = dzn_descriptor_heap_get_cpu_handle(&cmdbuf->snapshot_scratch, 0);
++      ID3D12Device1_CreateConstantBufferView(device->dev, &cbv, scratch);
++      ID3D12Device1_CopyDescriptorsSimple(device->dev, 1, destination, scratch,
++         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++   } else {
++      ID3D12Device1_CreateConstantBufferView(device->dev, &cbv, destination);
++   }
++   if (stage_begin)
++      dzn_profile_descriptor_end("snapshot_create_cbv", stage_begin, 1, &cbv_stats);
++   return true;
++}
++
++/* Descriptor tables can retain references to resources no longer used by a
++ * shader. Never dereference a stale CPU-side resource pointer while inspecting
++ * those tables. A generation also detects reuse of an allocator address.
++ */
++static bool
++dzn_cmd_buffer_snapshot_uniform(struct dzn_cmd_buffer *cmdbuf,
++                                struct dzn_device *device,
++                                struct dzn_descriptor_heap *heap, uint32_t slot,
++                                const struct dzn_buffer_desc *info)
++{
++   if (!info->buffer || !device->snapshot_live_buffers)
++      return false;
++   DZN_PROFILE_BEGIN(device);
++   /* Independent command buffers may record concurrently. Readers can overlap;
++    * buffer insertion, destruction and memory release remain exclusive.
++    */
++   u_rwlock_rdlock(&device->snapshot_buffers_lock);
++   struct hash_entry *entry = _mesa_hash_table_search(device->snapshot_live_buffers, info->buffer);
++   bool live = entry && (uint64_t)(uintptr_t)entry->data == info->snapshot_generation;
++   bool result = live && dzn_cmd_buffer_snapshot_uniform_live(cmdbuf, device, heap, slot, info);
++   if (!live && getenv("DZN_DIAG_ALLOC")) {
++      static unsigned trace_count;
++      if (p_atomic_inc_return(&trace_count) <= 16)
++         fprintf(stderr, "DZN_STALE_UNIFORM generation=%llu\n", (unsigned long long)info->snapshot_generation);
++   }
++   u_rwlock_rdunlock(&device->snapshot_buffers_lock);
++   DZN_PROFILE_END("dzn_cmd_buffer_snapshot_uniform", 1);
++   return result;
++}
++
+ static void
+ dzn_cmd_buffer_update_heaps(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint)
+ {
+@@ -3306,6 +3683,16 @@
+                dzn_descriptor_heap_copy(device, dst_heap, dst_heap_offset + set_heap_offset,
+                                         &set->pool->heaps[type], set->heap_offsets[type],
+                                         set_desc_count, type);
++               if (device->snapshot_uniforms && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
++                   set->pool->heaps[type].uniform_descs) {
++                  for (uint32_t j = 0; j < set_desc_count; j++) {
++                     const struct dzn_buffer_desc *desc =
++                        &set->pool->heaps[type].uniform_descs[set->heap_offsets[type] + j];
++                     if (desc->buffer)
++                        dzn_cmd_buffer_snapshot_uniform(cmdbuf, device, dst_heap,
++                           dst_heap_offset + set_heap_offset + j, desc);
++                  }
++               }
+             }
+ 
+             if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+@@ -3318,9 +3705,13 @@
+ 
+                   bool primary_is_writable = bdesc.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+                   uint32_t desc_heap_offset = pipeline->sets[s].dynamic_buffer_heap_offsets[o].primary;
+-                  dzn_descriptor_heap_write_buffer_desc(device, dst_heap,
+-                                                        dst_heap_offset + set_heap_offset + desc_heap_offset,
+-                                                        primary_is_writable, &bdesc);
++                  if (!(device->snapshot_uniforms &&
++                        bdesc.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
++                        dzn_cmd_buffer_snapshot_uniform(cmdbuf, device, dst_heap,
++                           dst_heap_offset + set_heap_offset + desc_heap_offset, &bdesc)))
++                     dzn_descriptor_heap_write_buffer_desc(device, dst_heap,
++                        dst_heap_offset + set_heap_offset + desc_heap_offset,
++                        primary_is_writable, &bdesc);
+ 
+                   if (pipeline->sets[s].dynamic_buffer_heap_offsets[o].alt != ~0) {
+                      assert(primary_is_writable);
+--- a/src/microsoft/vulkan/dzn_descriptor_set.c
++++ b/src/microsoft/vulkan/dzn_descriptor_set.c
+@@ -1,3 +1,5 @@
++#include "util/vma.h"
++#include <errno.h>
+ /*
+  * Copyright © Microsoft Corporation
+  *
+@@ -913,11 +915,151 @@
+                                      pCreateInfo, pAllocator, pPipelineLayout);
+ }
+ 
++/* CPU descriptor heap objects are expensive under WSL D3D12. A logical
++ * Vulkan staging heap owns a disjoint range in a shared, CPU-only backing page.
++ * GPU-visible heaps always retain the original independent heap path.
++ */
++struct dzn_cpu_descriptor_page {
++   struct dzn_cpu_descriptor_page *next;
++   struct util_vma_heap slots;
++   ID3D12DescriptorHeap *heap;
++   D3D12_DESCRIPTOR_HEAP_TYPE type;
++   SIZE_T cpu_base;
++   uint32_t refs;
++};
++
++static HRESULT
++dzn_cpu_descriptor_heap_alloc(struct dzn_descriptor_heap *heap,
++                              struct dzn_device *device,
++                              D3D12_DESCRIPTOR_HEAP_TYPE type,
++                              uint32_t count)
++{
++   mtx_lock(&device->cpu_descriptor_pool_lock);
++   struct dzn_cpu_descriptor_page *page;
++   uint64_t allocation = 0;
++   for (page = device->cpu_descriptor_pages; page; page = page->next) {
++      if (page->type == type)
++         allocation = util_vma_heap_alloc(&page->slots, count, 1);
++      if (allocation)
++         break;
++   }
++   HRESULT result = S_OK;
++   if (!page) {
++      page = calloc(1, sizeof(*page));
++      if (!page) {
++         result = E_OUTOFMEMORY;
++         goto done;
++      }
++      uint32_t capacity = MAX2(count, 65536);
++      D3D12_DESCRIPTOR_HEAP_DESC desc = {
++         .Type = type, .NumDescriptors = capacity,
++         .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
++      };
++      result = ID3D12Device1_CreateDescriptorHeap(device->dev, &desc,
++         &IID_ID3D12DescriptorHeap, (void **)&page->heap);
++      if (FAILED(result)) {
++         free(page);
++         goto done;
++      }
++      page->type = type;
++      page->cpu_base = dzn_ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(page->heap).ptr;
++      util_vma_heap_init(&page->slots, 1, capacity);
++      allocation = util_vma_heap_alloc(&page->slots, count, 1);
++      if (!allocation) {
++         util_vma_heap_finish(&page->slots);
++         ID3D12DescriptorHeap_Release(page->heap);
++         free(page);
++         result = E_OUTOFMEMORY;
++         goto done;
++      }
++      page->next = device->cpu_descriptor_pages;
++      device->cpu_descriptor_pages = page;
++      device->cpu_descriptor_pages_created++;
++      device->cpu_descriptor_pages_live++;
++      device->cpu_descriptor_pages_peak = MAX2(device->cpu_descriptor_pages_peak,
++         device->cpu_descriptor_pages_live);
++   } else {
++      device->cpu_descriptor_reuses++;
++   }
++   page->refs++;
++   heap->cpu_page = page;
++   heap->cpu_owner = device;
++   heap->cpu_allocation = allocation;
++   heap->heap = page->heap;
++   ID3D12DescriptorHeap_AddRef(heap->heap);
++   heap->cpu_base = page->cpu_base + (allocation - 1) * heap->desc_sz;
++   heap->gpu_base = 0;
++   device->cpu_descriptor_allocations++;
++done:
++   mtx_unlock(&device->cpu_descriptor_pool_lock);
++   return result;
++}
++
++static void
++dzn_cpu_descriptor_heap_free(struct dzn_descriptor_heap *heap)
++{
++   if (!heap->cpu_page)
++      return;
++   struct dzn_device *device = heap->cpu_owner;
++   struct dzn_cpu_descriptor_page *page = heap->cpu_page;
++   mtx_lock(&device->cpu_descriptor_pool_lock);
++   util_vma_heap_free(&page->slots, heap->cpu_allocation, heap->desc_count);
++   assert(page->refs > 0);
++   if (!--page->refs) {
++      struct dzn_cpu_descriptor_page **link = &device->cpu_descriptor_pages;
++      while (*link != page)
++         link = &(*link)->next;
++      *link = page->next;
++      util_vma_heap_finish(&page->slots);
++      ID3D12DescriptorHeap_Release(page->heap);
++      free(page);
++      device->cpu_descriptor_pages_live--;
++   }
++   mtx_unlock(&device->cpu_descriptor_pool_lock);
++   heap->cpu_page = NULL;
++}
++
++void
++dzn_cpu_descriptor_pool_finish(struct dzn_device *device)
++{
++   if (!device->cpu_descriptor_pool_initialized)
++      return;
++   if (debug_get_bool_option("DZN_TRACE_DESCRIPTOR_HEAPS", false))
++      fprintf(stderr, "DZN_CPU_DESCRIPTOR_POOL_SUMMARY allocations=%llu reused_ranges=%llu backing_pages_created=%llu backing_pages_peak=%llu remaining_pages=%llu\n",
++         (unsigned long long)device->cpu_descriptor_allocations,
++         (unsigned long long)device->cpu_descriptor_reuses,
++         (unsigned long long)device->cpu_descriptor_pages_created,
++         (unsigned long long)device->cpu_descriptor_pages_peak,
++         (unsigned long long)device->cpu_descriptor_pages_live);
++   struct dzn_cpu_descriptor_page *page = device->cpu_descriptor_pages;
++   while (page) {
++      struct dzn_cpu_descriptor_page *next = page->next;
++      util_vma_heap_finish(&page->slots);
++      ID3D12DescriptorHeap_Release(page->heap);
++      free(page);
++      page = next;
++   }
++   device->cpu_descriptor_pages = NULL;
++   mtx_destroy(&device->cpu_descriptor_pool_lock);
++   device->cpu_descriptor_pool_initialized = false;
++}
++
++static int64_t dzn_live_heap_count[4], dzn_live_heap_descriptors[4], dzn_total_heap_count[4];
++
+ void
+ dzn_descriptor_heap_finish(struct dzn_descriptor_heap *heap)
+ {
++   free(heap->uniform_descs);
++   heap->uniform_descs = NULL;
++   if (heap->track_heap) {
++      p_atomic_dec(&dzn_live_heap_count[heap->tracked_type]);
++      p_atomic_add(&dzn_live_heap_descriptors[heap->tracked_type], -(int64_t)heap->desc_count);
++      heap->track_heap = false;
++   }
++   dzn_cpu_descriptor_heap_free(heap);
+    if (heap->heap)
+       ID3D12DescriptorHeap_Release(heap->heap);
++   heap->heap = NULL;
+ }
+ 
+ VkResult
+@@ -928,6 +1070,10 @@
+                          bool shader_visible)
+ {
+    heap->desc_count = desc_count;
++   heap->track_heap = false;
++   heap->cpu_page = NULL;
++   heap->heap = NULL;
++   heap->uniform_descs = NULL;
+    heap->desc_sz = ID3D12Device1_GetDescriptorHandleIncrementSize(device->dev, type);
+ 
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {
+@@ -938,21 +1084,57 @@
+                D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+    };
+ 
+-   if (FAILED(ID3D12Device1_CreateDescriptorHeap(device->dev, &desc,
+-                                                 &IID_ID3D12DescriptorHeap,
+-                                                 (void **)&heap->heap))) {
++   HRESULT heap_result;
++   if (device->cpu_descriptor_pool_initialized && !shader_visible && desc_count)
++      heap_result = dzn_cpu_descriptor_heap_alloc(heap, device, type, desc_count);
++   else
++      heap_result = ID3D12Device1_CreateDescriptorHeap(device->dev, &desc,
++         &IID_ID3D12DescriptorHeap, (void **)&heap->heap);
++   if (FAILED(heap_result)) {
++      int saved_errno = errno;
++      fprintf(stderr, "DZN_DESCRIPTOR_HEAP_FAIL type=%u count=%u visible=%u hr=%08x errno=%d removed=%08x\n",
++         type, desc_count, shader_visible, (unsigned)heap_result, saved_errno,
++         (unsigned)ID3D12Device1_GetDeviceRemovedReason(device->dev));
++      for (uint32_t i = 0; i < 4; i++)
++         fprintf(stderr, "DZN_DESCRIPTOR_HEAP_COUNTS type=%u live=%lld descriptors=%lld total=%lld\n",
++            i, (long long)p_atomic_read(&dzn_live_heap_count[i]),
++            (long long)p_atomic_read(&dzn_live_heap_descriptors[i]),
++            (long long)p_atomic_read(&dzn_total_heap_count[i]));
+       return vk_error(device,
+                       shader_visible ?
+                       VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
+-   D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = dzn_ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap->heap);
+-   heap->cpu_base = cpu_handle.ptr;
++   if (device->snapshot_uniforms && !shader_visible &&
++       type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
++      heap->uniform_descs = calloc(desc_count, sizeof(*heap->uniform_descs));
++      if (!heap->uniform_descs) {
++         fprintf(stderr, "DZN_DESCRIPTOR_METADATA_FAIL count=%u bytes=%llu errno=%d\n",
++            desc_count, (unsigned long long)desc_count * sizeof(*heap->uniform_descs), errno);
++         dzn_cpu_descriptor_heap_free(heap);
++         ID3D12DescriptorHeap_Release(heap->heap);
++         heap->heap = NULL;
++         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++   }
++
++   if (!heap->cpu_page) {
++      D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = dzn_ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap->heap);
++      heap->cpu_base = cpu_handle.ptr;
++      heap->gpu_base = 0;
++   }
+    if (shader_visible) {
+       D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle = dzn_ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap->heap);
+       heap->gpu_base = gpu_handle.ptr;
+    }
+ 
++   if (debug_get_bool_option("DZN_TRACE_DESCRIPTOR_HEAPS", false)) {
++      heap->tracked_type = type;
++      heap->track_heap = true;
++      p_atomic_inc(&dzn_live_heap_count[type]);
++      p_atomic_add(&dzn_live_heap_descriptors[type], desc_count);
++      p_atomic_inc(&dzn_total_heap_count[type]);
++   }
+    return VK_SUCCESS;
+ }
+ 
+@@ -978,6 +1160,7 @@
+                                        uint32_t desc_offset,
+                                        const struct dzn_sampler *sampler)
+ {
++   DZN_PROFILE_BEGIN(device);
+    struct dzn_physical_device *pdev = container_of(device->vk.physical, struct dzn_physical_device, vk);
+    if (device->dev11 && pdev->options14.AdvancedTextureOpsSupported)
+       ID3D12Device11_CreateSampler2(device->dev11, &sampler->desc,
+@@ -985,19 +1168,86 @@
+    else
+       ID3D12Device1_CreateSampler(device->dev, (D3D12_SAMPLER_DESC *)&sampler->desc,
+                                   dzn_descriptor_heap_get_cpu_handle(heap, desc_offset));
+-}
++   DZN_PROFILE_END("dzn_descriptor_heap_write_sampler_desc", 1);
++}
++
++/* Three immutable descriptors per image view: SRV, cube-as-array SRV,
++ * and UAV. A fixed block budget bounds CPU descriptor memory. Falling back
++ * to ordinary descriptor creation is correct when the optional cache is full.
++ */
++#define DZN_CPU_IMAGE_CACHE_BLOCKS 21845
+ 
+ void
+-dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
+-                                          struct dzn_descriptor_heap *heap,
+-                                          uint32_t desc_offset,
+-                                          bool writeable, bool cube_as_2darray,
+-                                          const struct dzn_image_view *iview)
+-{
+-   D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
+-      dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
++dzn_cpu_image_cache_init(struct dzn_device *device)
++{
++   if (!debug_get_bool_option("DZN_CACHE_IMAGE_DESCRIPTORS", false))
++      return;
++   uint32_t *blocks = malloc(DZN_CPU_IMAGE_CACHE_BLOCKS * sizeof(*blocks));
++   if (!blocks)
++      return;
++   if (mtx_init(&device->cpu_image_cache_lock, mtx_plain) != thrd_success) {
++      free(blocks);
++      return;
++   }
++   if (dzn_descriptor_heap_init(&device->cpu_image_cache, device,
++         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, DZN_CPU_IMAGE_CACHE_BLOCKS * 3,
++         false) != VK_SUCCESS) {
++      mtx_destroy(&device->cpu_image_cache_lock);
++      free(blocks);
++      return;
++   }
++   /* This heap contains immutable image views only, never UBO metadata. */
++   free(device->cpu_image_cache.uniform_descs);
++   device->cpu_image_cache.uniform_descs = NULL;
++   device->cpu_image_free_blocks = blocks;
++   device->cpu_image_cache_initialized = true;
++}
++
++void
++dzn_cpu_image_cache_finish(struct dzn_device *device)
++{
++   if (!device->cpu_image_cache_initialized)
++      return;
++   dzn_descriptor_heap_finish(&device->cpu_image_cache);
++   mtx_destroy(&device->cpu_image_cache_lock);
++   free(device->cpu_image_free_blocks);
++   device->cpu_image_cache_initialized = false;
++}
++
++int
++dzn_cpu_image_cache_alloc(struct dzn_device *device)
++{
++   if (!device->cpu_image_cache_initialized)
++      return -1;
++   mtx_lock(&device->cpu_image_cache_lock);
++   int slot = -1;
++   if (device->cpu_image_free_count)
++      slot = device->cpu_image_free_blocks[--device->cpu_image_free_count];
++   else if (device->cpu_image_next_block < DZN_CPU_IMAGE_CACHE_BLOCKS)
++      slot = device->cpu_image_next_block++ * 3;
++   mtx_unlock(&device->cpu_image_cache_lock);
++   return slot;
++}
++
++void
++dzn_cpu_image_cache_free(struct dzn_device *device, int slot)
++{
++   if (slot < 0)
++      return;
++   assert(device->cpu_image_cache_initialized && slot % 3 == 0);
++   mtx_lock(&device->cpu_image_cache_lock);
++   assert(device->cpu_image_free_count < DZN_CPU_IMAGE_CACHE_BLOCKS);
++   device->cpu_image_free_blocks[device->cpu_image_free_count++] = slot;
++   mtx_unlock(&device->cpu_image_cache_lock);
++}
++
++static void
++dzn_image_view_write_raw(struct dzn_device *device,
++                         const struct dzn_image_view *iview,
++                         bool writeable, bool cube_as_2darray,
++                         D3D12_CPU_DESCRIPTOR_HANDLE view_handle)
++{
+    struct dzn_image *image = container_of(iview->vk.image, struct dzn_image, vk);
+-
+    if (writeable) {
+       ID3D12Device1_CreateUnorderedAccessView(device->dev, image->res, NULL, &iview->uav_desc, view_handle);
+    } else if (cube_as_2darray &&
+@@ -1029,6 +1279,48 @@
+    } else {
+       ID3D12Device1_CreateShaderResourceView(device->dev, image->res, &iview->srv_desc, view_handle);
+    }
++ }
++
++void
++dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
++                                          struct dzn_descriptor_heap *heap,
++                                          uint32_t desc_offset,
++                                          bool writeable, bool cube_as_2darray,
++                                          const struct dzn_image_view *iview)
++{
++   DZN_PROFILE_BEGIN(device);
++   if (heap->uniform_descs)
++      memset(&heap->uniform_descs[desc_offset], 0, sizeof(*heap->uniform_descs));
++   D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
++      dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
++   if (iview->cpu_image_cache_slot >= 0) {
++      bool cube = iview->srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY ||
++                  iview->srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE;
++      uint32_t variant = writeable ? 2 : cube_as_2darray && cube ? 1 : 0;
++      uint32_t bit = 1u << variant;
++      D3D12_CPU_DESCRIPTOR_HANDLE source = dzn_descriptor_heap_get_cpu_handle(
++         &device->cpu_image_cache, iview->cpu_image_cache_slot + variant);
++      /* Only cache on the same legal use that would otherwise create this
++       * descriptor. Some views never need an SRV or a cube-array variant.
++       * The atomic ready bit publishes a completed CPU descriptor, while the
++       * device lock serializes first-use writers. Subsequent copies are lockless.
++       */
++      struct dzn_image_view *cached_view = (struct dzn_image_view *)iview;
++      if (!(p_atomic_read(&cached_view->cpu_image_cache_ready) & bit)) {
++         mtx_lock(&device->cpu_image_cache_lock);
++         uint32_t ready = p_atomic_read(&cached_view->cpu_image_cache_ready);
++         if (!(ready & bit)) {
++            dzn_image_view_write_raw(device, iview, writeable, cube_as_2darray, source);
++            p_atomic_set(&cached_view->cpu_image_cache_ready, ready | bit);
++         }
++         mtx_unlock(&device->cpu_image_cache_lock);
++      }
++      ID3D12Device1_CopyDescriptorsSimple(device->dev, 1, view_handle, source,
++         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++   } else {
++      dzn_image_view_write_raw(device, iview, writeable, cube_as_2darray, view_handle);
++   }
++   DZN_PROFILE_END("dzn_descriptor_heap_write_image_view_desc", 1);
+ }
+ 
+ void
+@@ -1038,6 +1330,10 @@
+                                            bool writeable,
+                                            const struct dzn_buffer_view *bview)
+ {
++   DZN_PROFILE_BEGIN(device);
++   if (heap->uniform_descs)
++      memset(&heap->uniform_descs[desc_offset], 0, sizeof(*heap->uniform_descs));
++
+    D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
+       dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
+ 
+@@ -1045,6 +1341,7 @@
+       ID3D12Device1_CreateUnorderedAccessView(device->dev, bview->buffer->res, NULL, &bview->uav_desc, view_handle);
+    else
+       ID3D12Device1_CreateShaderResourceView(device->dev, bview->buffer->res, &bview->srv_desc, view_handle);
++   DZN_PROFILE_END("dzn_descriptor_heap_write_buffer_view_desc", 1);
+ }
+ 
+ void
+@@ -1054,6 +1351,17 @@
+                                       bool writeable,
+                                       const struct dzn_buffer_desc *info)
+ {
++   DZN_PROFILE_BEGIN(device);
++   if (heap->uniform_descs) {
++      if (info->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
++      {
++         heap->uniform_descs[desc_offset] = *info;
++         heap->uniform_descs[desc_offset].snapshot_generation = info->buffer->snapshot_generation;
++      }
++      else
++         memset(&heap->uniform_descs[desc_offset], 0, sizeof(*heap->uniform_descs));
++   }
++
+    D3D12_CPU_DESCRIPTOR_HANDLE view_handle =
+       dzn_descriptor_heap_get_cpu_handle(heap, desc_offset);
+ 
+@@ -1094,6 +1402,7 @@
+       };
+       ID3D12Device1_CreateShaderResourceView(device->dev, info->buffer->res, &srv_desc, view_handle);
+    }
++   DZN_PROFILE_END("dzn_descriptor_heap_write_buffer_desc", 1);
+ }
+ 
+ static void
+@@ -1308,15 +1617,27 @@
+                          uint32_t desc_count,
+                          D3D12_DESCRIPTOR_HEAP_TYPE type)
+ {
++   DZN_PROFILE_BEGIN(device);
+    D3D12_CPU_DESCRIPTOR_HANDLE dst_handle =
+       dzn_descriptor_heap_get_cpu_handle(dst_heap, dst_offset);
+    D3D12_CPU_DESCRIPTOR_HANDLE src_handle =
+       dzn_descriptor_heap_get_cpu_handle(src_heap, src_offset);
+ 
++   if (dst_heap->uniform_descs) {
++      if (src_heap->uniform_descs)
++         memmove(dst_heap->uniform_descs + dst_offset,
++                 src_heap->uniform_descs + src_offset,
++                 desc_count * sizeof(*dst_heap->uniform_descs));
++      else
++         memset(dst_heap->uniform_descs + dst_offset, 0,
++                desc_count * sizeof(*dst_heap->uniform_descs));
++   }
++
+    ID3D12Device1_CopyDescriptorsSimple(device->dev, desc_count,
+                                        dst_handle,
+                                        src_handle,
+                                        type);
++   DZN_PROFILE_END("dzn_descriptor_heap_copy", desc_count);
+ }
+ 
+ struct dzn_descriptor_set_ptr {
+@@ -1476,6 +1797,7 @@
+ 
+    assert(dynamic_buffer_idx < set->layout->dynamic_buffers.count);
+    set->dynamic_buffers[dynamic_buffer_idx] = *info;
++   set->dynamic_buffers[dynamic_buffer_idx].snapshot_generation = info->buffer->snapshot_generation;
+ }
+ 
+ static void
+@@ -1683,6 +2005,14 @@
+             set->heap_offsets[type] = align(set->heap_offsets[type], 2);
+          set->heap_sizes[type] = layout->range_desc_count[type] + variable_descriptor_count[type];
+          set->pool->free_offset[type] = set->heap_offsets[type] + set->heap_sizes[type];
++      }
++   }
++
++   if (!device->bindless) {
++      dzn_foreach_pool_type(type) {
++         if (pool->heaps[type].uniform_descs)
++            memset(pool->heaps[type].uniform_descs + set->heap_offsets[type], 0,
++                   set->heap_sizes[type] * sizeof(*pool->heaps[type].uniform_descs));
+       }
+    }
+ 
+@@ -1866,6 +2196,7 @@
+                         VkDescriptorPool descriptorPool,
+                         VkDescriptorPoolResetFlags flags)
+ {
++   VK_FROM_HANDLE(dzn_device, ddev, device);
+    VK_FROM_HANDLE(dzn_descriptor_pool, pool, descriptorPool);
+ 
+    for (uint32_t s = 0; s < pool->set_count; s++)
+@@ -1874,6 +2205,9 @@
+    dzn_foreach_pool_type(type) {
+       pool->free_offset[type] = 0;
+       pool->used_desc_count[type] = 0;
++      if (!ddev->bindless && pool->heaps[type].uniform_descs)
++         memset(pool->heaps[type].uniform_descs, 0,
++                pool->heaps[type].desc_count * sizeof(*pool->heaps[type].uniform_descs));
+    }
+    pool->used_set_count = 0;
+ 
+@@ -2265,8 +2599,9 @@
+ 
+       assert(src_type == dst_type);
+       uint32_t count =
+-         MIN2(dzn_descriptor_set_remaining_descs_in_binding(src_set->layout, &src_ptr),
+-              dzn_descriptor_set_remaining_descs_in_binding(dst_set->layout, &dst_ptr));
++         MIN2(MIN2(dzn_descriptor_set_remaining_descs_in_binding(src_set->layout, &src_ptr),
++                   dzn_descriptor_set_remaining_descs_in_binding(dst_set->layout, &dst_ptr)),
++              pDescriptorCopy->descriptorCount - copied_count);
+ 
+       if (vk_descriptor_type_is_dynamic(src_type)) {
+          uint32_t src_idx =
+@@ -2340,11 +2675,13 @@
+                          const VkCopyDescriptorSet *pDescriptorCopies)
+ {
+    VK_FROM_HANDLE(dzn_device, device, _device);
++   DZN_PROFILE_BEGIN(device);
+    for (unsigned i = 0; i < descriptorWriteCount; i++)
+       dzn_descriptor_set_write(device, &pDescriptorWrites[i]);
+ 
+    for (unsigned i = 0; i < descriptorCopyCount; i++)
+       dzn_descriptor_set_copy(device, &pDescriptorCopies[i]);
++   DZN_PROFILE_END("dzn_UpdateDescriptorSets", descriptorWriteCount + descriptorCopyCount);
+ }
+ 
+ static void
+--- a/src/microsoft/vulkan/dzn_device.c
++++ b/src/microsoft/vulkan/dzn_device.c
+@@ -469,7 +469,7 @@
+                        VK_QUEUE_TRANSFER_BIT,
+          .queueCount = 4,
+          .timestampValidBits = 64,
+-         .minImageTransferGranularity = { 0, 0, 0 },
++         .minImageTransferGranularity = { 1, 1, 1 },
+       },
+       .desc = {
+          .Type = D3D12_COMMAND_LIST_TYPE_DIRECT,
+@@ -482,7 +482,7 @@
+                        VK_QUEUE_TRANSFER_BIT,
+          .queueCount = 8,
+          .timestampValidBits = 64,
+-         .minImageTransferGranularity = { 0, 0, 0 },
++         .minImageTransferGranularity = { 1, 1, 1 },
+       },
+       .desc = {
+          .Type = D3D12_COMMAND_LIST_TYPE_COMPUTE,
+@@ -552,6 +552,13 @@
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+       .heapIndex = mem->memoryHeapCount - 1,
+    };
++   /* Recording-time uniform snapshots read application upload memory on the
++    * CPU. Allow applications using that compatibility mode to select the
++    * existing write-back heap path for their first host-visible memory type.
++    * Keep memory-type indices stable and advertise the actual cache policy.
++    */
++   if (debug_get_bool_option("DZN_CACHED_UPLOADS", false))
++      mem->memoryTypes[mem->memoryTypeCount - 1].propertyFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    mem->memoryTypes[mem->memoryTypeCount++] = (VkMemoryType) {
+       .propertyFlags = ram_device_local_property |
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+@@ -2222,6 +2229,9 @@
+       mtx_destroy(&device->device_heaps[type].lock);
+    }
+ 
++   dzn_cpu_image_cache_finish(device);
++   dzn_cpu_descriptor_pool_finish(device);
++   dzn_upload_pool_finish(device);
+    if (device->dev_config)
+       ID3D12DeviceConfiguration_Release(device->dev_config);
+ 
+@@ -2240,6 +2250,10 @@
+    if (device->dev13)
+       ID3D12Device1_Release(device->dev13);
+ 
++   if (device->snapshot_live_buffers)
++      _mesa_hash_table_destroy(device->snapshot_live_buffers, NULL);
++   if (device->snapshot_registry_initialized)
++      u_rwlock_destroy(&device->snapshot_buffers_lock);
+    vk_device_finish(&device->vk);
+    vk_free2(&instance->vk.alloc, pAllocator, device);
+ }
+@@ -2423,6 +2437,38 @@
+    }
+ 
+    device->support_static_samplers = true;
++   device->snapshot_uniforms = debug_get_bool_option("DZN_SNAPSHOT_UNIFORMS", false);
++   device->profile_descriptors = debug_get_bool_option("DZN_PROFILE_DESCRIPTORS", false);
++   device->stage_snapshot_descriptors = debug_get_bool_option("DZN_STAGE_SNAPSHOT_DESCRIPTORS", false);
++   device->cached_uniform_memory = debug_get_bool_option("DZN_CACHED_UNIFORM_MEMORY", false);
++   device->cache_uniform_regions = debug_get_bool_option("DZN_CACHE_UNIFORM_REGIONS", false);
++   device->pool_cpu_descriptors = debug_get_bool_option("DZN_POOL_CPU_DESCRIPTOR_HEAPS", false);
++   if (device->pool_cpu_descriptors) {
++      if (mtx_init(&device->cpu_descriptor_pool_lock, mtx_plain) != thrd_success) {
++         dzn_device_destroy(device, pAllocator);
++         return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++      device->cpu_descriptor_pool_initialized = true;
++   }
++   device->pool_uploads = debug_get_bool_option("DZN_POOL_UPLOADS", false);
++   if (device->pool_uploads) {
++      if (mtx_init(&device->upload_pool_lock, mtx_plain) != thrd_success) {
++         dzn_device_destroy(device, pAllocator);
++         return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++      device->upload_pool_initialized = true;
++      int64_t mb = debug_get_num_option("DZN_UPLOAD_POOL_MAX_MB", 256);
++      device->upload_pool_limit = MAX2(16, MIN2(512, mb)) * 1024ull * 1024ull;
++   }
++   if (device->snapshot_uniforms) {
++      u_rwlock_init(&device->snapshot_buffers_lock);
++      device->snapshot_registry_initialized = true;
++      device->snapshot_live_buffers = _mesa_hash_table_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
++      if (!device->snapshot_live_buffers) {
++         dzn_device_destroy(device, pAllocator);
++         return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++   }
+    device->bindless = (instance->debug_flags & DZN_DEBUG_BINDLESS) != 0 ||
+       device->vk.enabled_features.descriptorIndexing ||
+       device->vk.enabled_extensions.EXT_descriptor_indexing ||
+@@ -2447,6 +2493,7 @@
+       }
+    }
+ 
++   dzn_cpu_image_cache_init(device);
+    assert(queue_count == qindex);
+    *out = dzn_device_to_handle(device);
+    return VK_SUCCESS;
+@@ -2549,6 +2596,15 @@
+ 
+    struct dzn_device *device = container_of(mem->base.device, struct dzn_device, vk);
+ 
++   if (device->snapshot_live_buffers) {
++      u_rwlock_wrlock(&device->snapshot_buffers_lock);
++      hash_table_foreach(device->snapshot_live_buffers, entry) {
++         struct dzn_buffer *buf = (struct dzn_buffer *)entry->key;
++         if (buf->memory == mem)
++            buf->memory = NULL;
++      }
++      u_rwlock_wrunlock(&device->snapshot_buffers_lock);
++   }
+    if (mem->map && mem->map_res)
+       ID3D12Resource_Unmap(mem->map_res, 0, NULL);
+ 
+@@ -3043,6 +3099,13 @@
+ 
+    struct dzn_device *device = container_of(buf->base.device, struct dzn_device, vk);
+ 
++   if (device->snapshot_live_buffers) {
++      u_rwlock_wrlock(&device->snapshot_buffers_lock);
++      struct hash_entry *entry = _mesa_hash_table_search(device->snapshot_live_buffers, buf);
++      if (entry)
++         _mesa_hash_table_remove(device->snapshot_live_buffers, entry);
++      u_rwlock_wrunlock(&device->snapshot_buffers_lock);
++   }
+    if (buf->res)
+       ID3D12Resource_Release(buf->res);
+ 
+@@ -3140,6 +3203,17 @@
+    if (external_info && external_info->handleTypes != 0)
+       buf->shared = true;
+ 
++   if (device->snapshot_live_buffers) {
++      u_rwlock_wrlock(&device->snapshot_buffers_lock);
++      buf->snapshot_generation = ++device->snapshot_generation_counter;
++      struct hash_entry *entry = _mesa_hash_table_insert(device->snapshot_live_buffers, buf,
++         (void *)(uintptr_t)buf->snapshot_generation);
++      u_rwlock_wrunlock(&device->snapshot_buffers_lock);
++      if (!entry) {
++         dzn_buffer_destroy(buf, pAllocator);
++         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++   }
+    *out = dzn_buffer_to_handle(buf);
+    return VK_SUCCESS;
+ }
+@@ -3291,6 +3365,25 @@
+    pMemoryRequirements->memoryRequirements.alignment = alignment;
+    pMemoryRequirements->memoryRequirements.memoryTypeBits =
+       dzn_physical_device_get_mem_type_mask_for_resource(pdev, &buffer->desc, buffer->shared);
++   /* Snapshot compatibility mode reads UBO bytes on the CPU. Restrict this
++    * resource to existing cached host memory when available, while preserving
++    * its device-local options and leaving every image/staging memory type alone.
++    */
++   if (device->cached_uniform_memory && (buffer->usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
++      uint32_t original = pMemoryRequirements->memoryRequirements.memoryTypeBits;
++      uint32_t cached_host = 0, uncached_host = 0;
++      for (uint32_t i = 0; i < pdev->memory.memoryTypeCount; i++) {
++         VkMemoryPropertyFlags properties = pdev->memory.memoryTypes[i].propertyFlags;
++         if ((original & (1u << i)) && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
++            if (properties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
++               cached_host |= 1u << i;
++            else
++               uncached_host |= 1u << i;
++         }
++      }
++      if (cached_host)
++         pMemoryRequirements->memoryRequirements.memoryTypeBits &= ~uncached_host;
++   }
+ 
+    vk_foreach_struct(ext, pMemoryRequirements->pNext) {
+       switch (ext->sType) {
+@@ -3340,6 +3433,8 @@
+             return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+       }
+ 
++      buffer->memory = mem;
++      buffer->memory_offset = pBindInfos[i].memoryOffset;
+       buffer->gpuva = ID3D12Resource_GetGPUVirtualAddress(buffer->res);
+ 
+       if (device->bindless) {
+--- a/src/microsoft/vulkan/dzn_image.c
++++ b/src/microsoft/vulkan/dzn_image.c
+@@ -1325,6 +1325,9 @@
+ void
+ dzn_image_view_finish(struct dzn_image_view *iview)
+ {
++   struct dzn_device *device = container_of(iview->vk.base.device, struct dzn_device, vk);
++   dzn_cpu_image_cache_free(device, iview->cpu_image_cache_slot);
++   iview->cpu_image_cache_slot = -1;
+    vk_image_view_finish(&iview->vk);
+ }
+ 
+@@ -1339,6 +1342,9 @@
+    ASSERTED uint32_t layer_count = dzn_get_layer_count(image, range);
+ 
+    vk_image_view_init(&device->vk, &iview->vk, pCreateInfo);
++   /* Internal stack views retain the uncached path. */
++   iview->cpu_image_cache_slot = -1;
++   iview->cpu_image_cache_ready = 0;
+ 
+    assert(layer_count > 0);
+    assert(range->baseMipLevel < image->vk.mip_levels);
+@@ -1393,7 +1399,7 @@
+    dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, iview->srv_bindless_slot);
+    dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, iview->uav_bindless_slot);
+ 
+-   vk_image_view_finish(&iview->vk);
++   dzn_image_view_finish(iview);
+    vk_free2(&device->vk.alloc, pAllocator, iview);
+ }
+ 
+@@ -1413,6 +1419,7 @@
+    dzn_image_view_init(device, iview, pCreateInfo);
+ 
+    iview->srv_bindless_slot = iview->uav_bindless_slot = -1;
++   iview->cpu_image_cache_slot = dzn_cpu_image_cache_alloc(device);
+    if (device->bindless) {
+       if (!(image->desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) {
+          iview->srv_bindless_slot = dzn_device_descriptor_heap_alloc_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -766,7 +766,7 @@
+       uint8_t spirv_hash[BLAKE3_KEY_LEN];
+       uint8_t dxil_hash[BLAKE3_KEY_LEN];
+       uint8_t nir_hash[BLAKE3_KEY_LEN];
+-      uint8_t link_hashes[BLAKE3_KEY_LEN][2];
++      uint8_t link_hashes[2][BLAKE3_KEY_LEN];
+    } stages[MESA_VULKAN_SHADER_STAGES] = { 0 };
+    const uint8_t *dxil_hashes[MESA_VULKAN_SHADER_STAGES] = { 0 };
+    uint8_t attribs_hash[BLAKE3_KEY_LEN];
+--- a/src/microsoft/vulkan/dzn_private.h
++++ b/src/microsoft/vulkan/dzn_private.h
+@@ -46,8 +46,10 @@
+ #include "util/bitset.h"
+ #include "util/blob.h"
+ #include "util/hash_table.h"
++#include "util/rwlock.h"
+ #include "util/u_dynarray.h"
+ #include "util/log.h"
++#include "util/os_time.h"
+ #include "dzn_drirc.h"
+ 
+ #include "shader_enums.h"
+@@ -262,10 +264,16 @@
+ 
+ struct dzn_descriptor_heap {
+    ID3D12DescriptorHeap *heap;
++   D3D12_DESCRIPTOR_HEAP_TYPE tracked_type;
++   bool track_heap;
++   struct dzn_cpu_descriptor_page *cpu_page;
++   struct dzn_device *cpu_owner;
++   uint64_t cpu_allocation;
+    SIZE_T cpu_base;
+    uint64_t gpu_base;
+    uint32_t desc_count;
+    uint32_t desc_sz;
++   struct dzn_buffer_desc *uniform_descs;
+ };
+ 
+ struct dzn_device_descriptor_heap {
+@@ -276,6 +284,14 @@
+ };
+ 
+ #define NUM_POOL_TYPES D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER + 1
++
++struct dzn_upload_cache_entry {
++   struct dzn_upload_cache_entry *next;
++   ID3D12Resource *res;
++   uint64_t size;
++   void *map;
++   D3D12_GPU_VIRTUAL_ADDRESS gpuva;
++};
+ 
+ struct dzn_device {
+    struct vk_device vk;
+@@ -308,9 +324,43 @@
+    struct dzn_queue *swapchain_queue;
+ 
+    bool bindless;
++   bool snapshot_uniforms;
++   bool profile_descriptors;
++   bool stage_snapshot_descriptors;
++   bool cached_uniform_memory;
++   bool cache_uniform_regions;
++   bool pool_uploads;
++   bool upload_pool_initialized;
++   mtx_t upload_pool_lock;
++   struct dzn_upload_cache_entry *upload_pool;
++   uint64_t upload_pool_bytes, upload_pool_limit, upload_pool_peak;
++   uint64_t upload_pool_hits, upload_pool_misses, upload_pool_returns, upload_pool_drops;
++   struct hash_table *snapshot_live_buffers;
++   struct u_rwlock snapshot_buffers_lock;
++   bool snapshot_registry_initialized;
++   uint64_t snapshot_generation_counter;
+    bool support_static_samplers;
+    struct dzn_device_descriptor_heap device_heaps[NUM_POOL_TYPES];
+-};
++   bool pool_cpu_descriptors;
++   bool cpu_descriptor_pool_initialized;
++   mtx_t cpu_descriptor_pool_lock;
++   struct dzn_cpu_descriptor_page *cpu_descriptor_pages;
++   uint64_t cpu_descriptor_pages_created, cpu_descriptor_pages_live, cpu_descriptor_pages_peak;
++   uint64_t cpu_descriptor_allocations, cpu_descriptor_reuses;
++   bool cpu_image_cache_initialized;
++   struct dzn_descriptor_heap cpu_image_cache;
++   mtx_t cpu_image_cache_lock;
++   uint32_t *cpu_image_free_blocks;
++   uint32_t cpu_image_free_count;
++   uint32_t cpu_image_next_block;
++};
++
++void dzn_upload_pool_finish(struct dzn_device *device);
++void dzn_cpu_descriptor_pool_finish(struct dzn_device *device);
++void dzn_cpu_image_cache_init(struct dzn_device *device);
++void dzn_cpu_image_cache_finish(struct dzn_device *device);
++int dzn_cpu_image_cache_alloc(struct dzn_device *device);
++void dzn_cpu_image_cache_free(struct dzn_device *device, int slot);
+ 
+ void dzn_meta_finish(struct dzn_device *device);
+ 
+@@ -430,6 +480,7 @@
+    struct dzn_buffer *buffer;
+    VkDeviceSize range;
+    VkDeviceSize offset;
++   uint64_t snapshot_generation;
+ };
+ 
+ #define MAX_DESCS_PER_SAMPLER_HEAP     D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE
+@@ -541,6 +592,9 @@
+    struct list_head link;
+    ID3D12Resource *res;
+    uint64_t size;
++   void *snapshot_map;
++   D3D12_GPU_VIRTUAL_ADDRESS gpuva;
++   bool upload_pool_eligible;
+ };
+ 
+ enum dzn_event_state {
+@@ -693,6 +747,9 @@
+    struct hash_table *transition_barriers;
+ 
+    struct dzn_descriptor_heap_pool cbv_srv_uav_pool, sampler_pool;
++   struct dzn_descriptor_heap snapshot_scratch;
++   struct hash_table *snapshot_regions;
++   uint32_t snapshot_region_bytes;
+    D3D12_CPU_DESCRIPTOR_HANDLE null_rtv;
+ 
+    struct list_head internal_bufs[DZN_INTERNAL_BUF_BUCKET_COUNT];
+@@ -708,6 +765,29 @@
+    D3D12_BARRIER_SYNC valid_sync;
+    D3D12_BARRIER_ACCESS valid_access;
+ };
++
++
++/* Diagnostic only: function durations overlap for nested functions. */
++struct dzn_profile_descriptor_stats { uint64_t first, calls, units, ns; };
++static inline void
++dzn_profile_descriptor_end(const char *name, uint64_t begin, uint32_t units,
++                          struct dzn_profile_descriptor_stats *stats)
++{
++   uint64_t end = os_time_get_nano();
++   if (!stats->first) stats->first = begin;
++   stats->calls++; stats->units += units; stats->ns += end - begin;
++   if (end - stats->first > 2000000000ull) {
++      fprintf(stderr, "DZN_PROFILE name=%s calls=%llu units=%llu function_ms=%.3f interval_ms=%.3f\n",
++         name, (unsigned long long)stats->calls, (unsigned long long)stats->units,
++         stats->ns / 1e6, (end - stats->first) / 1e6);
++      *stats = (struct dzn_profile_descriptor_stats){0};
++   }
++}
++#define DZN_PROFILE_BEGIN(device) uint64_t dzn_profile_start = (device)->profile_descriptors ? os_time_get_nano() : 0
++#define DZN_PROFILE_END(name, units) do { \
++   static _Thread_local struct dzn_profile_descriptor_stats dzn_profile_stats; \
++   if (dzn_profile_start) dzn_profile_descriptor_end(name, dzn_profile_start, units, &dzn_profile_stats); \
++} while (0)
+ 
+ struct dxil_spirv_bindless_entry;
+ struct dzn_descriptor_pool {
+@@ -1127,6 +1207,8 @@
+ 
+ struct dzn_image_view {
+    struct vk_image_view vk;
++   int cpu_image_cache_slot;
++   uint32_t cpu_image_cache_ready;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc;
+@@ -1150,6 +1232,9 @@
+ 
+    D3D12_RESOURCE_DESC desc;
+    ID3D12Resource *res;
++   struct dzn_device_memory *memory;
++   VkDeviceSize memory_offset;
++   uint64_t snapshot_generation;
+ 
+    VkBufferCreateFlags create_flags;
+    VkBufferUsageFlags usage;

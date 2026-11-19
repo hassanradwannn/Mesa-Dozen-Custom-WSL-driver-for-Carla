@@ -1,0 +1,8 @@
+{
+  "file_format_version": "1.0.1",
+  "ICD": {
+    "library_path": "../../../lib/x86_64-linux-gnu/libvulkan_dzn.so",
+    "library_arch": "64",
+    "api_version": "1.1.354"
+  }
+}

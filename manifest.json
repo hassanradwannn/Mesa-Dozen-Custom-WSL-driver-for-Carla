@@ -1,0 +1,18 @@
+{
+  "mesa_base_commit_reported": "ddaf85e353442d9d7f192fdcf1823e652e3f2ee3",
+  "mesa_version": "26.2.5",
+  "target": "Ubuntu 22.04 x86_64 WSL2",
+  "warning": "Reconstructed source differences; binary rebuild not CARLA-accepted by this packaging step.",
+  "variants": {
+    "working": {
+      "sha256": "33d4b222f9ea05bb18fcd10ac3cc757a3792b26919450eef3609427469674d14",
+      "source_prefix": "dzn-carla-fix",
+      "spirv_to_dxil_sha256": "6e17ab0c079d535e16d71a4f3e07aac04fd0568a77f4ea340af2eed0a0811a6a"
+    },
+    "descriptor-reset-candidate": {
+      "sha256": "cce0e8ac41b33b179c58e1a315c94d153fe1a7f031e57d09585a7d20616ccf78",
+      "source_prefix": "descriptor-reset-candidate-20261024",
+      "spirv_to_dxil_sha256": "44707f6be01b782e6f60681d60b88056b003ce9babb3c6fcaf01215cc035c6c7"
+    }
+  }
+}
